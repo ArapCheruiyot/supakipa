@@ -1675,7 +1675,7 @@ def ensure_plan():
     Creates a 'Solo' plan only if none exists.
     """
     try:
-        data = request.get_json(silent=True) or {}
+        data = request.get_json(force=True) or {}
         shop_id = data.get("shop_id")
 
         if not shop_id:
@@ -1691,11 +1691,13 @@ def ensure_plan():
               .document("default")
         )
 
-        if plan_ref.get().exists:
+        plan_doc = plan_ref.get()
+
+        if plan_doc.exists:
             return jsonify({
                 "success": True,
                 "message": "Plan already exists for this shop."
-            })
+            }), 200
 
         default_plan = {
             "name": "Solo",
@@ -1717,13 +1719,15 @@ def ensure_plan():
         return jsonify({
             "success": True,
             "message": "Default plan initialized successfully."
-        })
+        }), 200
 
     except Exception as e:
-        print(f"🔥 ensure-plan error: {e}")
+        print("🔥 ensure-plan error:", str(e))
+        import traceback
+        traceback.print_exc()
         return jsonify({
             "success": False,
-            "error": "Internal server error"
+            "error": str(e)
         }), 500
 
 
@@ -1815,6 +1819,7 @@ if os.environ.get("RENDER") == "true":
 if __name__ == "__main__":
     startup_init()
     app.run(debug=True)
+
 
 
 
