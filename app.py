@@ -1268,7 +1268,7 @@ def sales():
             }
         }), 500
 # ======================================================
-COMPLETE SALES ROUTE
+#COMPLETE SALES ROUTE
 #..............................................
 import time
 from datetime import datetime
@@ -1924,6 +1924,7 @@ if os.environ.get("RENDER") == "true":
 if __name__ == "__main__":
     startup_init()
     app.run(debug=True)
+
 
 
 
