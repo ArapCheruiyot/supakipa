@@ -1268,37 +1268,131 @@ def sales():
             }
         }), 500
 # ======================================================
-# COMPLETE SALES ROUTE (OPTIMIZED FOR RENDER FREE TIER)
 @app.route("/complete-sale", methods=["POST"])
-def complete_sale():
+def complete_sale_optimized():
     """
-    TEMPORARY ROUTE:
-    Logs the sale payload from the frontend when user clicks 'complete sale'.
-    Saves the raw data in Firestore for inspection.
+    COMPLETE SALE - Optimized for free-tier hosting
+    - Deducts stock
+    - Registers transactions
+    - Returns summary
     """
     try:
-        data = request.get_json()
-        if not data:
-            return jsonify({"status": "error", "message": "No JSON payload received"}), 400
+        data = request.get_json(force=True)
+        shop_id = data.get("shop_id")
+        seller = data.get("seller")
+        items = data.get("items", [])
 
-        # Log payload to console
-        print("\n" + "="*50)
-        print("🛒 COMPLETE SALE PAYLOAD RECEIVED")
-        print(json.dumps(data, indent=2))
-        print("="*50 + "\n")
+        if not shop_id or not items:
+            return jsonify({"success": False, "error": "Missing shop_id or items"}), 400
 
-        # Optionally, save to Firestore for inspection
-        doc_ref = db.collection("debug_sales").document()
-        doc_ref.set({
+        updated_items = []
+        batch_writes = []
+
+        for cart_item in items:
+            item_id = cart_item.get("item_id")
+            category_id = cart_item.get("category_id")
+            batch_id = cart_item.get("batch_id") or cart_item.get("batchId")
+            quantity = float(cart_item.get("quantity", 0))
+            unit = cart_item.get("unit", "unit")
+            conversion_factor = float(cart_item.get("conversion_factor", 1))
+            item_type = cart_item.get("type", "main_item")
+
+            # Basic validation
+            if not item_id or not category_id or not batch_id or quantity <= 0:
+                continue  # skip invalid items
+
+            # Firestore refs
+            item_ref = db.collection("Shops").document(shop_id)\
+                        .collection("categories").document(category_id)\
+                        .collection("items").document(item_id)
+            item_doc = item_ref.get()
+            if not item_doc.exists:
+                continue  # skip missing items
+
+            item_data = item_doc.to_dict()
+            batches = item_data.get("batches", [])
+            total_stock = float(item_data.get("stock", 0))
+
+            # Find batch
+            batch_index = next((i for i, b in enumerate(batches) if b.get("id") == batch_id), None)
+            if batch_index is None:
+                continue
+
+            batch = batches[batch_index]
+            batch_qty = float(batch.get("quantity", 0))
+
+            # Compute base units
+            base_qty = quantity / conversion_factor if item_type == "selling_unit" else quantity
+
+            # Skip if insufficient stock
+            if batch_qty < base_qty:
+                continue
+
+            # Deduct stock
+            batches[batch_index]["quantity"] = batch_qty - base_qty
+            new_total_stock = total_stock - base_qty
+
+            # Price calculation
+            sell_price = float(batch.get("sellPrice", 0))
+            total_price = (sell_price / conversion_factor) * quantity if item_type == "selling_unit" else sell_price * base_qty
+
+            # Stock transaction
+            stock_txn = {
+                "id": f"sale_{int(time.time() * 1000)}",
+                "type": "sale",
+                "item_type": item_type,
+                "batchId": batch_id,
+                "quantity": base_qty,
+                "selling_units_quantity": quantity if item_type == "selling_unit" else None,
+                "unit": unit,
+                "sellPrice": sell_price,
+                "unitPrice": sell_price / conversion_factor if item_type == "selling_unit" else sell_price,
+                "totalPrice": total_price,
+                "timestamp": int(datetime.now().timestamp()),
+                "performedBy": seller
+            }
+
+            stock_transactions = item_data.get("stockTransactions", [])
+            stock_transactions.append(stock_txn)
+
+            # Schedule update
+            batch_writes.append(item_ref.update({
+                "batches": batches,
+                "stock": new_total_stock,
+                "stockTransactions": stock_transactions,
+                "lastStockUpdate": firestore.SERVER_TIMESTAMP,
+                "lastTransactionId": stock_txn["id"]
+            }))
+
+            # Record summary
+            updated_items.append({
+                "item_id": item_id,
+                "item_type": item_type,
+                "batch_id": batch_id,
+                "quantity_sold": quantity,
+                "base_units_deducted": base_qty,
+                "remaining_batch_quantity": batches[batch_index]["quantity"],
+                "remaining_total_stock": new_total_stock,
+                "total_price": total_price
+            })
+
+        # Optional: save raw payload for debugging
+        db.collection("debug_sales").document().set({
             "payload": data,
             "received_at": firestore.SERVER_TIMESTAMP
         })
 
-        return jsonify({"status": "success", "message": "Sale data logged successfully"}), 200
+        return jsonify({
+            "success": True,
+            "updated_items": updated_items,
+            "message": "Sale completed successfully"
+        }), 200
 
     except Exception as e:
-        print(f"❌ Error in /complete-sale: {e}")
-        return jsonify({"status": "error", "message": str(e)}), 500
+        import traceback
+        traceback.print_exc()
+        return jsonify({"success": False, "error": str(e)}), 500
+
 
 # ======================================================
 # ITEM OPTIMIZATION (UPDATED WITH BATCH INFO)
@@ -1530,6 +1624,7 @@ if os.environ.get("RENDER") == "true":
 if __name__ == "__main__":
     startup_init()
     app.run(debug=True)
+
 
 
 
