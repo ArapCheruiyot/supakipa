@@ -1271,193 +1271,77 @@ def sales():
 # ======================================================
 # COMPLETE SALES ROUTE (FULLY WORKING VERSION)
 # ======================================================
-@app.route("/complete-sale", methods=["POST"])
-def complete_sale_minimal():
+@app.route("/sales", methods=["POST"])
+def process_sales():
     """
-    Minimal complete-sale endpoint:
-    - Expects items array where every item has a batch_id.
-    - Deducts base units from the batch.quantity and item.stock.
-    - Handles selling_unit -> base-unit conversion using conversion_factor.
-    - Returns updated_items and failed_items with reasons.
-    NOTE: This uses a Firestore WriteBatch (not transactions). Good for small carts.
+    Process each item in the cart independently.
+    Deduct 1 from the specified batch stock and log the sale in Firebase.
     """
     try:
-        data = request.get_json(force=True) or {}
-        shop_id = data.get("shop_id")
+        data = request.get_json() or {}
         items = data.get("items", [])
+        shop_id = data.get("shop_id", "unknown")
+        user = data.get("user", {"authUid": "unknown", "name": "unknown", "email": "unknown"})
+        
+        success = []
+        failed = []
 
-        if not shop_id or not items:
-            return jsonify({"success": False, "error": "Missing shop_id or items"}), 400
-
-        # Prepare
-        item_refs = []
-        cart_map = []  # preserve mapping to original cart item
-        for ci in items:
-            item_id = ci.get("item_id")
-            category_id = ci.get("category_id")
-            batch_id = ci.get("batch_id") or ci.get("batchId")
+        for item in items:
             try:
-                quantity = float(ci.get("quantity", 0))
-            except Exception:
-                quantity = 0.0
+                item_id = item.get("itemId")
+                batch_id = item.get("batchId")
+                unit = item.get("unit")
+                sell_price = item.get("sellPrice")
+                timestamp = int(time.time())
 
-            # require minimal fields: item_id, category_id, batch_id, positive quantity
-            if not item_id or not category_id or not batch_id or quantity <= 0:
-                # mark as failed later
-                cart_map.append({"cart_item": ci, "valid": False, "reason": "missing item/category/batch or quantity<=0"})
-                continue
+                # Fetch batch stock
+                batch_ref = db.collection("Shops").document(shop_id)\
+                              .collection("categories").document(item.get("categoryId"))\
+                              .collection("items").document(item_id)\
+                              .collection("batches").document(batch_id)
 
-            item_ref = (db.collection("Shops")
-                          .document(shop_id)
-                          .collection("categories")
-                          .document(category_id)
-                          .collection("items")
-                          .document(item_id))
-            item_refs.append(item_ref)
-            cart_map.append({"cart_item": ci, "valid": True, "ref": item_ref})
-
-        # Bulk fetch existing item docs
-        fetched_docs = []
-        if item_refs:
-            try:
-                fetched_docs = list(db.get_all(item_refs))
-            except Exception as e:
-                # If fetching fails, return clear error
-                return jsonify({"success": False, "error": f"Failed to fetch items: {str(e)}"}), 500
-
-        # Prepare batch updates
-        batch = db.batch()
-        updated_items = []
-        failed_items = []
-
-        fetched_iter = iter(fetched_docs)
-        for entry in cart_map:
-            ci = entry["cart_item"]
-            if not entry.get("valid"):
-                failed_items.append({"item": ci, "reason": entry.get("reason")})
-                continue
-
-            # pop next fetched doc (order preserved)
-            try:
-                item_doc = next(fetched_iter)
-            except StopIteration:
-                failed_items.append({"item": ci, "reason": "Missing fetched doc"})
-                continue
-
-            if not item_doc.exists:
-                failed_items.append({"item": ci, "reason": "Item doc not found"})
-                continue
-
-            item_data = item_doc.to_dict()
-            batches = item_data.get("batches", [])
-            batch_id = ci.get("batch_id") or ci.get("batchId")
-            # find batch index
-            batch_index = next((i for i, b in enumerate(batches) if b.get("id") == batch_id), None)
-            if batch_index is None:
-                failed_items.append({"item": ci, "reason": f"Batch {batch_id} not found"})
-                continue
-
-            try:
-                quantity = float(ci.get("quantity", 0))
-            except Exception:
-                failed_items.append({"item": ci, "reason": "Invalid quantity"})
-                continue
-
-            item_type = ci.get("type", "main_item")
-            conversion_factor = float(ci.get("conversion_factor", 1) or 1)
-
-            # compute base units
-            if item_type == "selling_unit":
-                if conversion_factor <= 0:
-                    failed_items.append({"item": ci, "reason": "Invalid conversion_factor"})
+                batch_doc = batch_ref.get()
+                if not batch_doc.exists:
+                    failed.append({"itemId": item_id, "reason": "Batch not found"})
                     continue
-                base_qty = quantity / conversion_factor
-            else:
-                base_qty = quantity
 
-            # available in batch
-            batch_doc = batches[batch_index]
-            try:
-                batch_qty = float(batch_doc.get("quantity", 0))
-            except Exception:
-                batch_qty = 0.0
+                batch_data = batch_doc.to_dict()
+                current_stock = batch_data.get("quantity", 0)
 
-            # check stock
-            if batch_qty + 1e-12 < base_qty:  # small epsilon
-                failed_items.append({
-                    "item": ci,
-                    "reason": "Insufficient batch stock",
-                    "available": batch_qty,
-                    "requested_base": base_qty
-                })
-                continue
+                if current_stock < 1:
+                    failed.append({"itemId": item_id, "reason": "Insufficient stock"})
+                    continue
 
-            # deduct
-            new_batch_qty = batch_qty - base_qty
-            # update arrays in memory
-            batches[batch_index]["quantity"] = new_batch_qty
+                # Deduct stock by 1
+                batch_ref.update({"quantity": current_stock - 1})
 
-            # compute new total item stock
-            try:
-                total_stock = float(item_data.get("stock", 0))
-            except Exception:
-                total_stock = 0.0
-            new_total_stock = total_stock - base_qty
+                # Record sale log
+                sale_id = f"sale_{timestamp}_{item_id}"
+                sale_log = {
+                    "id": sale_id,
+                    "itemId": item_id,
+                    "batchId": batch_id,
+                    "unit": unit,
+                    "sellPrice": sell_price,
+                    "timestamp": timestamp,
+                    "performedBy": user,
+                    "shopId": shop_id,
+                    "type": "sale"
+                }
 
-            # prepare a tiny transaction record (optional but useful)
-            txn_id = f"sale_{int(time.time() * 1000)}"
-            stock_txn = {
-                "id": txn_id,
-                "type": "sale",
-                "item_type": item_type,
-                "batchId": batch_id,
-                "quantity": base_qty,
-                "selling_units_quantity": quantity if item_type == "selling_unit" else None,
-                "timestamp": int(time.time()),
-            }
+                db.collection("Shops").document(shop_id)\
+                  .collection("auditLogs").document("debug_sales")\
+                  .collection("sales").document(sale_id).set(sale_log)
 
-            # Build update payload
-            update_payload = {
-                "batches": batches,
-                "stock": new_total_stock,
-                "lastStockUpdate": firestore.SERVER_TIMESTAMP,
-                "lastTransactionId": txn_id,
-                # Append transaction to array safely
-                "stockTransactions": firestore.ArrayUnion([stock_txn])
-            }
+                success.append({"itemId": item_id, "batchId": batch_id})
+            
+            except Exception as e:
+                failed.append({"itemId": item.get("itemId"), "reason": str(e)})
 
-            # schedule batch update
-            batch.update(item_doc.reference, update_payload)
-
-            updated_items.append({
-                "item_id": ci.get("item_id"),
-                "batch_id": batch_id,
-                "quantity_deducted_base": base_qty,
-                "remaining_batch_quantity": new_batch_qty,
-                "remaining_item_stock": new_total_stock,
-                "txn_id": txn_id
-            })
-
-        # commit if we have writes
-        try:
-            # if there are no writes (empty batch), db.batch().commit() is harmless but skip for clarity
-            if updated_items:
-                batch.commit()
-        except Exception as e:
-            return jsonify({"success": False, "error": f"Failed to write updates: {str(e)}"}), 500
-
-        return jsonify({
-            "success": True,
-            "updated_items": updated_items,
-            "failed_items": failed_items,
-            "message": "Stock deduction attempted"
-        }), 200
+        return jsonify({"success": success, "failed": failed}), 200
 
     except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return jsonify({"success": False, "error": str(e)}), 500
-
+        return jsonify({"error": str(e)}), 500
 
 # ======================================================
 # ITEM OPTIMIZATION (UPDATED WITH BATCH INFO)
@@ -1689,6 +1573,7 @@ if os.environ.get("RENDER") == "true":
 if __name__ == "__main__":
     startup_init()
     app.run(debug=True)
+
 
 
 
