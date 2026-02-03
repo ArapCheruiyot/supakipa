@@ -1268,155 +1268,122 @@ def sales():
             }
         }), 500
 # ======================================================
-# ======================================================
-# COMPLETE SALES ROUTE (FULLY WORKING VERSION)
-# ======================================================
-@app.route("/sale", methods=["POST"])
-def process_sales():
+#COMPLETE SALE
+#======================================================
+# Add these imports if not already present
+import json
+from datetime import datetime
+from flask import request, jsonify
+import logging
+
+# Configure logging for this route
+sale_logger = logging.getLogger('sale_logger')
+
+@app.route('/complete-sale', methods=['POST'])
+def complete_sale():
     """
-    Process each item in the cart independently.
-    Deduct 1 from the specified batch stock and log the sale in Firebase.
-    """
-    try:
-        data = request.get_json() or {}
-        items = data.get("items", [])
-        shop_id = data.get("shop_id", "unknown")
-        user = data.get("user", {"authUid": "unknown", "name": "unknown", "email": "unknown"})
-        
-        success = []
-        failed = []
-
-        for item in items:
-            try:
-                item_id = item.get("itemId")
-                batch_id = item.get("batchId")
-                unit = item.get("unit")
-                sell_price = item.get("sellPrice")
-                timestamp = int(time.time())
-
-                # Fetch batch stock
-                batch_ref = db.collection("Shops").document(shop_id)\
-                              .collection("categories").document(item.get("categoryId"))\
-                              .collection("items").document(item_id)\
-                              .collection("batches").document(batch_id)
-
-                batch_doc = batch_ref.get()
-                if not batch_doc.exists:
-                    failed.append({"itemId": item_id, "reason": "Batch not found"})
-                    continue
-
-                batch_data = batch_doc.to_dict()
-                current_stock = batch_data.get("quantity", 0)
-
-                if current_stock < 1:
-                    failed.append({"itemId": item_id, "reason": "Insufficient stock"})
-                    continue
-
-                # Deduct stock by 1
-                batch_ref.update({"quantity": current_stock - 1})
-
-                # Record sale log
-                sale_id = f"sale_{timestamp}_{item_id}"
-                sale_log = {
-                    "id": sale_id,
-                    "itemId": item_id,
-                    "batchId": batch_id,
-                    "unit": unit,
-                    "sellPrice": sell_price,
-                    "timestamp": timestamp,
-                    "performedBy": user,
-                    "shopId": shop_id,
-                    "type": "sale"
-                }
-
-                db.collection("Shops").document(shop_id)\
-                  .collection("auditLogs").document("debug_sales")\
-                  .collection("sales").document(sale_id).set(sale_log)
-
-                success.append({"itemId": item_id, "batchId": batch_id})
-            
-            except Exception as e:
-                failed.append({"itemId": item.get("itemId"), "reason": str(e)})
-
-        return jsonify({"success": success, "failed": failed}), 200
-
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-#-----------------------------------------
-#Complete Sale
-#---------------------------------
-@app.route("/complete-sales", methods=["POST"])
-def process_sales():
-    """
-    Process each item in the cart independently.
-    Deduct 1 from the specified batch stock and log the sale in Firebase.
+    Test endpoint that logs all sale data from frontend
     """
     try:
-        data = request.get_json() or {}
-        items = data.get("items", [])
-        shop_id = data.get("shop_id", "unknown")
-        user = data.get("user", {"authUid": "unknown", "name": "unknown", "email": "unknown"})
+        # Get the raw data
+        raw_data = request.get_data(as_text=True)
         
-        success = []
-        failed = []
-
-        for item in items:
-            try:
-                item_id = item.get("itemId")
-                batch_id = item.get("batchId")
-                unit = item.get("unit")
-                sell_price = item.get("sellPrice")
-                timestamp = int(time.time())
-
-                # Fetch batch stock
-                batch_ref = db.collection("Shops").document(shop_id)\
-                              .collection("categories").document(item.get("categoryId"))\
-                              .collection("items").document(item_id)\
-                              .collection("batches").document(batch_id)
-
-                batch_doc = batch_ref.get()
-                if not batch_doc.exists:
-                    failed.append({"itemId": item_id, "reason": "Batch not found"})
-                    continue
-
-                batch_data = batch_doc.to_dict()
-                current_stock = batch_data.get("quantity", 0)
-
-                if current_stock < 1:
-                    failed.append({"itemId": item_id, "reason": "Insufficient stock"})
-                    continue
-
-                # Deduct stock by 1
-                batch_ref.update({"quantity": current_stock - 1})
-
-                # Record sale log
-                sale_id = f"sale_{timestamp}_{item_id}"
-                sale_log = {
-                    "id": sale_id,
-                    "itemId": item_id,
-                    "batchId": batch_id,
-                    "unit": unit,
-                    "sellPrice": sell_price,
-                    "timestamp": timestamp,
-                    "performedBy": user,
-                    "shopId": shop_id,
-                    "type": "sale"
-                }
-
-                db.collection("Shops").document(shop_id)\
-                  .collection("auditLogs").document("debug_sales")\
-                  .collection("sales").document(sale_id).set(sale_log)
-
-                success.append({"itemId": item_id, "batchId": batch_id})
-            
-            except Exception as e:
-                failed.append({"itemId": item.get("itemId"), "reason": str(e)})
-
-        return jsonify({"success": success, "failed": failed}), 200
-
+        # Parse JSON
+        data = request.get_json()
+        if not data:
+            return jsonify({
+                "success": False,
+                "error": "No JSON data received"
+            }), 400
+        
+        # Log to console
+        print("\n" + "="*60)
+        print("📦 /complete-sale REQUEST RECEIVED")
+        print("="*60)
+        print(f"📅 Time: {datetime.now().isoformat()}")
+        print(f"🏪 Shop ID: {data.get('shop_id', 'MISSING')}")
+        print(f"👤 User ID: {data.get('user_id', 'MISSING')}")
+        
+        # Seller info
+        seller = data.get('seller', {})
+        print(f"👨‍💼 Seller: {seller.get('name', 'Unknown')}")
+        print(f"📧 Email: {seller.get('email', 'No email')}")
+        print(f"🔑 Type: {seller.get('type', 'Unknown')}")
+        
+        # Items
+        items = data.get('items', [])
+        print(f"\n🛍️ Items: {len(items)}")
+        
+        for i, item in enumerate(items, 1):
+            print(f"\n  Item #{i}:")
+            print(f"    Name: {item.get('name', 'N/A')}")
+            print(f"    Type: {item.get('type', 'main_item')}")
+            print(f"    Item ID: {item.get('item_id', 'N/A')}")
+            print(f"    Batch ID: {item.get('batch_id', 'N/A')}")
+            print(f"    Qty: {item.get('quantity', 0)}")
+            print(f"    Price: ${item.get('price', 0):.2f}")
+            print(f"    Stock: {item.get('real_available', 'N/A')}")
+            print(f"    Can Fulfill: {item.get('can_fulfill', True)}")
+        
+        # Payment info
+        payment = data.get('payment', {})
+        print(f"\n💳 Payment: {payment.get('method', 'cash')}")
+        print(f"💰 Amount: ${payment.get('cashAmount', 0):.2f}")
+        
+        # Calculate totals
+        total_qty = sum(item.get('quantity', 0) for item in items)
+        total_amount = sum(item.get('price', 0) * item.get('quantity', 0) for item in items)
+        
+        print(f"\n📊 Summary:")
+        print(f"   Total Quantity: {total_qty}")
+        print(f"   Total Amount: ${total_amount:.2f}")
+        print("="*60)
+        
+        # Save to log file
+        try:
+            with open('sales_log.txt', 'a') as f:
+                f.write(f"\n{datetime.now().isoformat()}\n")
+                f.write(f"Shop: {data.get('shop_id')}\n")
+                f.write(f"User: {data.get('user_id')}\n")
+                f.write(f"Items: {len(items)}\n")
+                f.write(f"Total: ${total_amount:.2f}\n")
+                f.write("-"*40 + "\n")
+        except Exception as e:
+            print(f"⚠️ Could not write to log file: {e}")
+        
+        # Return success response
+        return jsonify({
+            "success": True,
+            "message": "Sale data received and logged",
+            "received_at": datetime.now().isoformat(),
+            "summary": {
+                "items_count": len(items),
+                "total_quantity": total_qty,
+                "total_amount": total_amount,
+                "seller_name": seller.get('name')
+            },
+            "debug": {
+                "raw_data_length": len(raw_data),
+                "shop_id_received": data.get('shop_id') is not None,
+                "items_received": len(items) > 0
+            }
+        }), 200
+        
+    except json.JSONDecodeError as e:
+        print(f"❌ JSON Error: {e}")
+        return jsonify({
+            "success": False,
+            "error": "Invalid JSON format",
+            "message": str(e)
+        }), 400
+        
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
+        print(f"❌ Unexpected error: {e}")
+        return jsonify({
+            "success": False,
+            "error": "Internal server error",
+            "message": str(e)
+        }), 500
 # ======================================================
 # ITEM OPTIMIZATION (UPDATED WITH BATCH INFO)
 # ======================================================
@@ -1647,6 +1614,7 @@ if os.environ.get("RENDER") == "true":
 if __name__ == "__main__":
     startup_init()
     app.run(debug=True)
+
 
 
 
