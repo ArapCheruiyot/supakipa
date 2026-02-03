@@ -1270,120 +1270,445 @@ def sales():
 # ======================================================
 #COMPLETE SALE
 #======================================================
-# Add these imports if not already present
 import json
 from datetime import datetime
+from decimal import Decimal, ROUND_HALF_UP
+import math
 from flask import request, jsonify
+import firebase_admin
+from firebase_admin import credentials, firestore
 import logging
 
-# Configure logging for this route
-sale_logger = logging.getLogger('sale_logger')
+# Configure logging
+logger = logging.getLogger('sale_processor')
+
+# Initialize Firebase if not already done
+try:
+    if not firebase_admin._apps:
+        cred = credentials.Certificate('path/to/serviceAccountKey.json')
+        firebase_admin.initialize_app(cred)
+    db = firestore.client()
+except:
+    logger.warning("Firebase not initialized - running in test mode")
 
 @app.route('/complete-sale', methods=['POST'])
 def complete_sale():
     """
-    Test endpoint that logs all sale data from frontend
+    Complete sale with unit conversion logic
+    Handles: Base units (direct) and Selling units (converted)
+    Supports: Floating point quantities
     """
+    
+    # ============== 1. INITIAL SETUP & VALIDATION ==============
     try:
-        # Get the raw data
-        raw_data = request.get_data(as_text=True)
-        
-        # Parse JSON
         data = request.get_json()
         if not data:
             return jsonify({
                 "success": False,
-                "error": "No JSON data received"
+                "error": "No data received"
             }), 400
         
-        # Log to console
-        print("\n" + "="*60)
-        print("📦 /complete-sale REQUEST RECEIVED")
-        print("="*60)
-        print(f"📅 Time: {datetime.now().isoformat()}")
-        print(f"🏪 Shop ID: {data.get('shop_id', 'MISSING')}")
-        print(f"👤 User ID: {data.get('user_id', 'MISSING')}")
-        
-        # Seller info
+        shop_id = data.get('shop_id')
+        user_id = data.get('user_id')
         seller = data.get('seller', {})
-        print(f"👨‍💼 Seller: {seller.get('name', 'Unknown')}")
-        print(f"📧 Email: {seller.get('email', 'No email')}")
-        print(f"🔑 Type: {seller.get('type', 'Unknown')}")
-        
-        # Items
         items = data.get('items', [])
-        print(f"\n🛍️ Items: {len(items)}")
-        
-        for i, item in enumerate(items, 1):
-            print(f"\n  Item #{i}:")
-            print(f"    Name: {item.get('name', 'N/A')}")
-            print(f"    Type: {item.get('type', 'main_item')}")
-            print(f"    Item ID: {item.get('item_id', 'N/A')}")
-            print(f"    Batch ID: {item.get('batch_id', 'N/A')}")
-            print(f"    Qty: {item.get('quantity', 0)}")
-            print(f"    Price: ${item.get('price', 0):.2f}")
-            print(f"    Stock: {item.get('real_available', 'N/A')}")
-            print(f"    Can Fulfill: {item.get('can_fulfill', True)}")
-        
-        # Payment info
         payment = data.get('payment', {})
-        print(f"\n💳 Payment: {payment.get('method', 'cash')}")
-        print(f"💰 Amount: ${payment.get('cashAmount', 0):.2f}")
         
-        # Calculate totals
-        total_qty = sum(item.get('quantity', 0) for item in items)
-        total_amount = sum(item.get('price', 0) * item.get('quantity', 0) for item in items)
+        # Validate required fields
+        if not shop_id or not user_id or not seller or len(items) == 0:
+            return jsonify({
+                "success": False,
+                "error": "Missing required fields: shop_id, user_id, seller, or items"
+            }), 400
         
-        print(f"\n📊 Summary:")
-        print(f"   Total Quantity: {total_qty}")
-        print(f"   Total Amount: ${total_amount:.2f}")
-        print("="*60)
+        # Generate unique IDs
+        timestamp = datetime.now()
+        sale_id = f"sale_{int(timestamp.timestamp())}_{abs(hash(str(data))) % 10000:04d}"
+        receipt_id = f"receipt_{int(timestamp.timestamp())}_{user_id[:8]}"
         
-        # Save to log file
-        try:
-            with open('sales_log.txt', 'a') as f:
-                f.write(f"\n{datetime.now().isoformat()}\n")
-                f.write(f"Shop: {data.get('shop_id')}\n")
-                f.write(f"User: {data.get('user_id')}\n")
-                f.write(f"Items: {len(items)}\n")
-                f.write(f"Total: ${total_amount:.2f}\n")
-                f.write("-"*40 + "\n")
-        except Exception as e:
-            print(f"⚠️ Could not write to log file: {e}")
-        
-        # Return success response
-        return jsonify({
-            "success": True,
-            "message": "Sale data received and logged",
-            "received_at": datetime.now().isoformat(),
-            "summary": {
-                "items_count": len(items),
-                "total_quantity": total_qty,
-                "total_amount": total_amount,
-                "seller_name": seller.get('name')
-            },
-            "debug": {
-                "raw_data_length": len(raw_data),
-                "shop_id_received": data.get('shop_id') is not None,
-                "items_received": len(items) > 0
-            }
-        }), 200
-        
-    except json.JSONDecodeError as e:
-        print(f"❌ JSON Error: {e}")
-        return jsonify({
-            "success": False,
-            "error": "Invalid JSON format",
-            "message": str(e)
-        }), 400
+        logger.info(f"🔄 Starting sale: {sale_id}")
+        logger.info(f"🏪 Shop: {shop_id}")
+        logger.info(f"👤 Seller: {seller.get('name')}")
+        logger.info(f"🛍️ Items to process: {len(items)}")
         
     except Exception as e:
-        print(f"❌ Unexpected error: {e}")
+        logger.error(f"❌ Initial validation failed: {e}")
         return jsonify({
             "success": False,
-            "error": "Internal server error",
+            "error": "Invalid request format",
             "message": str(e)
+        }), 400
+    
+    # ============== 2. PROCESS EACH ITEM ==============
+    processed_items = []
+    batch_updates = []
+    item_updates = []
+    transaction_records = []
+    
+    try:
+        for item_idx, item in enumerate(items):
+            logger.info(f"\n📦 Processing item {item_idx + 1}: {item.get('name')}")
+            
+            # Get item details
+            item_id = item.get('item_id')
+            batch_id = item.get('batch_id')
+            item_type = item.get('type', 'main_item')
+            original_quantity = float(item.get('quantity', 0))
+            sell_price = float(item.get('price', 0))
+            
+            # ========== 2A. UNIT CONVERSION LOGIC ==========
+            if item_type == 'selling_unit':
+                # This is a selling unit - needs conversion
+                conversion_factor = float(item.get('conversion_factor', 1.0))
+                sell_unit_id = item.get('sell_unit_id')
+                
+                if conversion_factor <= 0:
+                    raise ValueError(f"Invalid conversion factor: {conversion_factor}")
+                
+                # Calculate base quantity
+                base_quantity = original_quantity * conversion_factor
+                
+                # Round to 6 decimal places for consistency
+                base_quantity = round(base_quantity, 6)
+                
+                logger.info(f"   🔄 Converting selling unit:")
+                logger.info(f"     Original: {original_quantity} selling units")
+                logger.info(f"     Factor: 1 selling unit = {conversion_factor} base units")
+                logger.info(f"     Base units to deduct: {base_quantity}")
+                
+                unit_info = {
+                    'is_selling_unit': True,
+                    'sell_unit_id': sell_unit_id,
+                    'conversion_factor': conversion_factor,
+                    'selling_units_quantity': original_quantity,
+                    'base_units_quantity': base_quantity,
+                    'display_unit': item.get('display_name', 'unit'),
+                    'base_unit': 'unit'  # Default, could be from item data
+                }
+                
+            else:
+                # This is a base/main item - no conversion needed
+                base_quantity = original_quantity
+                logger.info(f"   ✅ Base item - deducting {base_quantity} units directly")
+                
+                unit_info = {
+                    'is_selling_unit': False,
+                    'selling_units_quantity': None,
+                    'base_units_quantity': base_quantity,
+                    'display_unit': 'unit',
+                    'base_unit': 'unit'
+                }
+            
+            # ========== 2B. VALIDATE QUANTITIES ==========
+            if base_quantity <= 0:
+                raise ValueError(f"Invalid quantity: {base_quantity}")
+            
+            # ========== 2C. PREPARE BATCH UPDATE ==========
+            batch_update = {
+                'shop_id': shop_id,
+                'item_id': item_id,
+                'batch_id': batch_id,
+                'deduct_quantity': base_quantity,  # Float!
+                'original_item': item,
+                'unit_info': unit_info,
+                'sell_price': sell_price
+            }
+            batch_updates.append(batch_update)
+            
+            # ========== 2D. PREPARE ITEM UPDATE ==========
+            item_update = {
+                'shop_id': shop_id,
+                'item_id': item_id,
+                'deduct_quantity': base_quantity,  # Float!
+                'sell_price': sell_price
+            }
+            item_updates.append(item_update)
+            
+            # ========== 2E. PREPARE TRANSACTION RECORD ==========
+            transaction_record = {
+                'id': f"{sale_id}_item{item_idx}",
+                'type': 'sale',
+                'item_id': item_id,
+                'item_name': item.get('name'),
+                'item_type': item_type,
+                'batch_id': batch_id,
+                'quantity': base_quantity,  # IN BASE UNITS
+                'selling_units_quantity': unit_info.get('selling_units_quantity'),
+                'conversion_factor': unit_info.get('conversion_factor'),
+                'unit_price': sell_price,
+                'total_price': base_quantity * sell_price,
+                'unit': unit_info['base_unit'],
+                'display_unit': unit_info['display_unit'],
+                'performed_by': seller,
+                'timestamp': timestamp.isoformat(),
+                'sale_id': sale_id,
+                'receipt_id': receipt_id
+            }
+            transaction_records.append(transaction_record)
+            
+            # ========== 2F. STORE PROCESSED ITEM FOR RECEIPT ==========
+            processed_item = item.copy()
+            processed_item.update({
+                'processed_at': timestamp.isoformat(),
+                'base_quantity_deducted': base_quantity,
+                'unit_info': unit_info,
+                'item_total': base_quantity * sell_price,
+                'sale_item_id': f"{sale_id}_item{item_idx}"
+            })
+            processed_items.append(processed_item)
+            
+            logger.info(f"   ✅ Processed: Deduct {base_quantity} base units")
+        
+    except Exception as e:
+        logger.error(f"❌ Item processing failed: {e}")
+        return jsonify({
+            "success": False,
+            "error": f"Failed to process items: {str(e)}",
+            "failed_at_item": item.get('name') if 'item' in locals() else 'unknown'
+        }), 400
+    
+    # ============== 3. EXECUTE DATABASE UPDATES ==============
+    try:
+        logger.info(f"\n💾 Executing database updates...")
+        
+        # Create a batch write for atomic updates
+        batch = db.batch()
+        
+        # Track totals
+        total_base_units = 0
+        total_amount = 0
+        
+        # 3A. UPDATE BATCHES
+        for batch_update in batch_updates:
+            item_ref = db.collection('Shops').document(batch_update['shop_id']) \
+                      .collection('items').document(batch_update['item_id'])
+            
+            # We need to update a specific batch in the array
+            # This requires reading the item first to find batch index
+            item_doc = item_ref.get()
+            if item_doc.exists:
+                item_data = item_doc.to_dict()
+                batches = item_data.get('batches', [])
+                
+                # Find the specific batch
+                batch_found = False
+                for i, b in enumerate(batches):
+                    if b.get('id') == batch_update['batch_id']:
+                        batch_found = True
+                        
+                        # Calculate new quantity (handle float)
+                        current_qty = float(b.get('quantity', 0))
+                        new_qty = current_qty - batch_update['deduct_quantity']
+                        
+                        # Safety check (even though frontend validated)
+                        if new_qty < -0.001:  # Small tolerance
+                            raise ValueError(f"Batch {batch_update['batch_id']} would go negative")
+                        
+                        # Update batch quantity
+                        batch_path = f'batches.{i}.quantity'
+                        batch.update(item_ref, {batch_path: round(new_qty, 6)})
+                        
+                        logger.info(f"   🔄 Batch {batch_update['batch_id']}: {current_qty} → {round(new_qty, 6)}")
+                        break
+                
+                if not batch_found:
+                    logger.warning(f"   ⚠️ Batch {batch_update['batch_id']} not found")
+            
+            total_base_units += batch_update['deduct_quantity']
+            total_amount += batch_update['deduct_quantity'] * batch_update['sell_price']
+        
+        # 3B. UPDATE ITEM STOCK
+        for item_update in item_updates:
+            item_ref = db.collection('Shops').document(item_update['shop_id']) \
+                      .collection('items').document(item_update['item_id'])
+            
+            # Get current stock
+            item_doc = item_ref.get()
+            if item_doc.exists:
+                item_data = item_doc.to_dict()
+                current_stock = float(item_data.get('stock', 0))
+                new_stock = current_stock - item_update['deduct_quantity']
+                
+                # Update stock
+                batch.update(item_ref, {
+                    'stock': round(new_stock, 6),
+                    'lastStockUpdate': timestamp.isoformat(),
+                    'lastTransactionId': sale_id,
+                    'updatedAt': timestamp.isoformat(),
+                    'updatedBy': seller
+                })
+                
+                logger.info(f"   📊 Item stock: {current_stock} → {round(new_stock, 6)}")
+        
+        # 3C. ADD TRANSACTION RECORDS
+        for transaction in transaction_records:
+            item_ref = db.collection('Shops').document(shop_id) \
+                      .collection('items').document(transaction['item_id'])
+            
+            batch.update(item_ref, {
+                'stockTransactions': firestore.ArrayUnion([transaction])
+            })
+        
+        # 3D. CREATE RECEIPT
+        receipt_ref = db.collection('Shops').document(shop_id) \
+                     .collection('receipts').document(receipt_id)
+        
+        receipt_data = {
+            'id': receipt_id,
+            'sale_id': sale_id,
+            'shop_id': shop_id,
+            'timestamp': timestamp.isoformat(),
+            'seller': seller,
+            'items': processed_items,
+            'original_cart': items,  # Keep original for reference
+            'summary': {
+                'total_items': len(items),
+                'total_base_units': round(total_base_units, 6),
+                'total_amount': round(total_amount, 2),
+                'contains_selling_units': any(i['unit_info']['is_selling_unit'] for i in processed_items),
+                'converted_items': sum(1 for i in processed_items if i['unit_info']['is_selling_unit'])
+            },
+            'payment': payment,
+            'status': 'completed',
+            'created_at': timestamp.isoformat()
+        }
+        
+        batch.set(receipt_ref, receipt_data)
+        
+        # 3E. CREATE AUDIT LOG
+        audit_ref = db.collection('Shops').document(shop_id) \
+                    .collection('auditLogs').document(f"audit_{sale_id}")
+        
+        audit_data = {
+            'id': f"audit_{sale_id}",
+            'action': 'sale_completed',
+            'performed_by': seller,
+            'timestamp': timestamp.isoformat(),
+            'details': {
+                'sale_id': sale_id,
+                'receipt_id': receipt_id,
+                'items_count': len(items),
+                'total_amount': round(total_amount, 2),
+                'total_base_units': round(total_base_units, 6),
+                'batch_count': len(batch_updates),
+                'had_conversions': any(i['unit_info']['is_selling_unit'] for i in processed_items)
+            }
+        }
+        
+        batch.set(audit_ref, audit_data)
+        
+        # 3F. COMMIT ALL UPDATES
+        batch.commit()
+        logger.info(f"✅ Database updates committed successfully")
+        
+    except Exception as e:
+        logger.error(f"❌ Database update failed: {e}")
+        return jsonify({
+            "success": False,
+            "error": "Database update failed",
+            "message": str(e),
+            "sale_id": sale_id
         }), 500
+    
+    # ============== 4. RETURN SUCCESS RESPONSE ==============
+    logger.info(f"\n🎉 SALE COMPLETED SUCCESSFULLY!")
+    logger.info(f"   Receipt: {receipt_id}")
+    logger.info(f"   Total: ${round(total_amount, 2)}")
+    logger.info(f"   Base Units: {round(total_base_units, 6)}")
+    logger.info(f"   Items: {len(items)}")
+    logger.info("=" * 60)
+    
+    return jsonify({
+        "success": True,
+        "message": "Sale completed successfully",
+        "sale_id": sale_id,
+        "receipt_id": receipt_id,
+        "receipt_number": receipt_id.split('_')[1] if '_' in receipt_id else receipt_id,
+        "timestamp": timestamp.isoformat(),
+        "summary": {
+            "total_amount": round(total_amount, 2),
+            "total_base_units": round(total_base_units, 6),
+            "items_count": len(items),
+            "selling_units_converted": sum(1 for i in processed_items if i['unit_info']['is_selling_unit'])
+        },
+        "receipt_url": f"/receipts/{receipt_id}",  # For frontend to display
+        "debug_info": {
+            "shop_id": shop_id,
+            "seller": seller.get('name'),
+            "batch_updates_count": len(batch_updates),
+            "transaction_records": len(transaction_records)
+        }
+    }), 200
+
+# ============== HELPER FUNCTIONS ==============
+
+def safe_float_operation(value, operation='round', precision=6):
+    """Safely handle float operations to avoid precision issues"""
+    try:
+        if operation == 'round':
+            return round(float(value), precision)
+        elif operation == 'add':
+            a, b = float(value[0]), float(value[1])
+            return round(a + b, precision)
+        elif operation == 'subtract':
+            a, b = float(value[0]), float(value[1])
+            return round(a - b, precision)
+    except:
+        return value
+
+def format_unit_display(item):
+    """Format item for display showing conversion if applicable"""
+    if item['unit_info']['is_selling_unit']:
+        return f"{item['quantity']} {item['unit_info']['display_unit']} = {item['base_quantity_deducted']} {item['unit_info']['base_unit']}"
+    else:
+        return f"{item['quantity']} {item['unit_info']['base_unit']}"
+
+# ============== TEST ENDPOINT ==============
+
+@app.route('/test-sale-conversion', methods=['POST'])
+def test_sale_conversion():
+    """Test endpoint to verify conversion logic without database updates"""
+    test_data = {
+        "base_item_example": {
+            "type": "main_item",
+            "quantity": 3,
+            "conversion_factor": 1,
+            "expected_base": 3.0
+        },
+        "selling_unit_example": {
+            "type": "selling_unit", 
+            "quantity": 5,
+            "conversion_factor": 0.25,
+            "expected_base": 1.25
+        },
+        "float_example": {
+            "type": "selling_unit",
+            "quantity": 2.5,
+            "conversion_factor": 0.333,
+            "expected_base": 0.8325
+        }
+    }
+    
+    results = {}
+    for test_name, test in test_data.items():
+        if test['type'] == 'selling_unit':
+            base_qty = test['quantity'] * test['conversion_factor']
+            base_qty = round(base_qty, 6)
+        else:
+            base_qty = test['quantity']
+        
+        results[test_name] = {
+            "calculated": base_qty,
+            "expected": test['expected_base'],
+            "match": abs(base_qty - test['expected_base']) < 0.0001,
+            "details": f"{test['quantity']} × {test.get('conversion_factor', 1)} = {base_qty}"
+        }
+    
+    return jsonify({
+        "success": True,
+        "test_results": results,
+        "message": "Unit conversion logic test complete"
+    })
 # ======================================================
 # ITEM OPTIMIZATION (UPDATED WITH BATCH INFO)
 # ======================================================
@@ -1614,6 +1939,7 @@ if os.environ.get("RENDER") == "true":
 if __name__ == "__main__":
     startup_init()
     app.run(debug=True)
+
 
 
 
